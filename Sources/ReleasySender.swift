@@ -14,7 +14,6 @@ public actor ReleasySender {
   /// before the browser finds a Releasy, are not lost. The oldest are dropped first.
   static let pendingCapacity = 500
 
-  public let id: String = "AnalyticReleasySender"
   private let encoder = JSONEncoder()
   private var browser: NWBrowser?
   private var connections = [NWEndpoint: NWConnection]()
