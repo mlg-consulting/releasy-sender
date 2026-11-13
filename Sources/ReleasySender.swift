@@ -130,6 +130,7 @@ extension ReleasySender {
     let deviceId: String
     let timestamp: TimeInterval
     let buildNumber: String
+    let user: String
     let content: Content
 
     public init(
@@ -138,6 +139,7 @@ extension ReleasySender {
       deviceId: String,
       timestamp: TimeInterval,
       buildNumber: String,
+      user: String,
       content: Content
     ) {
       self.id = id
@@ -145,11 +147,12 @@ extension ReleasySender {
       self.deviceId = deviceId
       self.timestamp = timestamp
       self.buildNumber = buildNumber
+      self.user = user
       self.content = content
     }
 
     private enum CodingKeys: String, CodingKey {
-      case v, kind, id, deviceId, bundleId, buildNumber, timestamp
+      case v, kind, id, deviceId, bundleId, buildNumber, user, timestamp
       case level, category, method, message
       case name, params
     }
@@ -161,6 +164,7 @@ extension ReleasySender {
       try container.encode(deviceId, forKey: .deviceId)
       try container.encode(bundleId, forKey: .bundleId)
       try container.encode(buildNumber, forKey: .buildNumber)
+      try container.encode(user, forKey: .user)
       try container.encode(timestamp, forKey: .timestamp)
       switch content {
       case let .analytics(name, params):
