@@ -121,7 +121,7 @@ public actor ReleasySender {
 extension ReleasySender {
   /// A log as sent to Releasy, in protocol version 1.
   public struct ReleasyPayload: Encodable, Sendable {
-    enum Content: Sendable {
+    public enum Content: Sendable {
       case analytics(name: String, params: Codable & Sendable)
       case console(level: String, category: String, method: String, message: String)
     }
