@@ -127,6 +127,8 @@ extension ReleasySender {
 
     let id: UUID
     let bundleId: String
+    let modelName: String
+    let systemVersion: String
     let deviceId: String
     let timestamp: TimeInterval
     let buildNumber: String
@@ -137,6 +139,8 @@ extension ReleasySender {
       id: UUID,
       bundleId: String,
       deviceId: String,
+      modelName: String,
+      systemVersion: String,
       timestamp: TimeInterval,
       buildNumber: String,
       user: String,
@@ -145,6 +149,8 @@ extension ReleasySender {
       self.id = id
       self.bundleId = bundleId
       self.deviceId = deviceId
+      self.modelName = modelName
+      self.systemVersion = systemVersion
       self.timestamp = timestamp
       self.buildNumber = buildNumber
       self.user = user
@@ -152,7 +158,7 @@ extension ReleasySender {
     }
 
     private enum CodingKeys: String, CodingKey {
-      case v, kind, id, deviceId, bundleId, buildNumber, user, timestamp
+      case v, kind, id, deviceId, modelName, systemVersion, bundleId, buildNumber, user, timestamp
       case level, category, method, message
       case name, params
     }
@@ -162,6 +168,8 @@ extension ReleasySender {
       try container.encode(1, forKey: .v)
       try container.encode(id, forKey: .id)
       try container.encode(deviceId, forKey: .deviceId)
+      try container.encode(modelName, forKey: .modelName)
+      try container.encode(systemVersion, forKey: .systemVersion)
       try container.encode(bundleId, forKey: .bundleId)
       try container.encode(buildNumber, forKey: .buildNumber)
       try container.encode(user, forKey: .user)
