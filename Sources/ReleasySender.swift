@@ -25,7 +25,7 @@ public actor ReleasySender {
     Task { await setupBrowser() }
   }
 
-  private func send(_ payload: ReleasyPayload) {
+  public func send(_ payload: ReleasyPayload) {
     guard let data = try? encoder.encode(payload) else { return }
     let frame = data + Data([0x00])
     guard !readyEndpoints.isEmpty else {
@@ -40,7 +40,7 @@ public actor ReleasySender {
     }
   }
 
-  private func send(_ frame: Data, on connection: NWConnection) {
+  public func send(_ frame: Data, on connection: NWConnection) {
     connection.send(content: frame, completion: .contentProcessed({ error in
       if let error {
         print("Send data failed with \(error)")
@@ -120,7 +120,7 @@ public actor ReleasySender {
 
 extension ReleasySender {
   /// A log as sent to Releasy, in protocol version 1.
-  struct ReleasyPayload: Encodable, Sendable {
+  public struct ReleasyPayload: Encodable, Sendable {
     enum Content: Sendable {
       case analytics(name: String, params: Codable & Sendable)
       case console(level: String, category: String, method: String, message: String)
@@ -139,7 +139,7 @@ extension ReleasySender {
       case name, params
     }
 
-    func encode(to encoder: any Encoder) throws {
+    public func encode(to encoder: any Encoder) throws {
       var container = encoder.container(keyedBy: CodingKeys.self)
       try container.encode(1, forKey: .v)
       try container.encode(id, forKey: .id)
