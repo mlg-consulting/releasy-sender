@@ -32,6 +32,9 @@ public actor ReleasySender {
   }
 
   private let encoder = JSONEncoder()
+  /// The queue the browser and the connections deliver their events on, off the main thread so
+  /// that sending logs doesn't take time from the application's interface.
+  private let queue = DispatchQueue(label: "com.releasy.sender", qos: .utility)
   private var browser: NWBrowser?
   /// The Releasy instances currently advertised on the network.
   private var advertisedEndpoints = Set<NWEndpoint>()
@@ -83,7 +86,7 @@ public actor ReleasySender {
     browser.browseResultsChangedHandler = { [weak self] _, changes in
       Task { [weak self] in await self?.browseResultsChanged(changes: changes) }
     }
-    browser.start(queue: .main)
+    browser.start(queue: queue)
     self.browser = browser
   }
 
@@ -125,7 +128,7 @@ public actor ReleasySender {
     connection.stateUpdateHandler = { [weak self] newState in
       Task { [weak self] in await self?.connectionStateChanged(newState: newState, endpoint: endpoint, id: id) }
     }
-    connection.start(queue: .main)
+    connection.start(queue: queue)
   }
 
   /// Closes the connection to `endpoint`, if any, without retrying.
