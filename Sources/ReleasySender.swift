@@ -13,9 +13,13 @@ public actor ReleasySender {
   @Dependency(\.date.now) var now
   @Dependency(\.uuid) var uuid
 
-  /// The number of payloads kept while no Releasy is connected, so that the logs emitted at launch,
-  /// before the browser finds a Releasy, are not lost. The oldest are dropped first.
-  static let pendingCapacity = 500
+  /// The number of latest payloads kept and sent again to every Releasy that connects. The oldest
+  /// are dropped first.
+  ///
+  /// This covers the logs emitted before a Releasy is found, at launch, and those lost on a
+  /// connection that died before it was detected. Releasy ignores the logs it already received,
+  /// by their identifier.
+  static let historyCapacity = 500
 
   /// The longest wait between two connection attempts to a Releasy, in seconds.
   static let maximumRetryDelay: TimeInterval = 30
@@ -36,7 +40,7 @@ public actor ReleasySender {
   /// The number of failed attempts in a row, for each Releasy, which sets the delay before the next one.
   private var failedAttempts = [NWEndpoint: Int]()
   private var retryTasks = [NWEndpoint: Task<Void, Never>]()
-  private var pending = [Data]()
+  private var history = History(capacity: historyCapacity)
 
   public init() {
     Task {
@@ -48,13 +52,7 @@ public actor ReleasySender {
   public func send(_ payload: ReleasyPayload) {
     guard let data = try? encoder.encode(payload) else { return }
     let frame = data + Data([0x00])
-    guard !readyEndpoints.isEmpty else {
-      pending.append(frame)
-      if pending.count > Self.pendingCapacity {
-        pending.removeFirst(pending.count - Self.pendingCapacity)
-      }
-      return
-    }
+    history.append(frame)
     for endpoint in readyEndpoints {
       links[endpoint].map { send(frame, on: $0.connection) }
     }
@@ -149,8 +147,7 @@ public actor ReleasySender {
     case .ready:
       readyEndpoints.insert(endpoint)
       failedAttempts.removeValue(forKey: endpoint)
-      pending.forEach { send($0, on: link.connection) }
-      pending.removeAll()
+      history.frames.forEach { send($0, on: link.connection) }
     case .failed(let error):
       print("Connection failed with \(error)")
       retry(endpoint)
@@ -217,6 +214,23 @@ public actor ReleasySender {
       failedAttempts.removeValue(forKey: endpoint)
       disconnect(from: endpoint)
       connect(to: endpoint)
+    }
+  }
+}
+
+/// The latest frames, in sending order, up to a capacity: the oldest are dropped first.
+struct History {
+  let capacity: Int
+  private(set) var frames: [Data] = []
+
+  init(capacity: Int) {
+    self.capacity = capacity
+  }
+
+  mutating func append(_ frame: Data) {
+    frames.append(frame)
+    if frames.count > capacity {
+      frames.removeFirst(frames.count - capacity)
     }
   }
 }

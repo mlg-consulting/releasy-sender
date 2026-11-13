@@ -5,6 +5,7 @@
 //  Created by Loïc Griffé on 13/11/2026.
 //
 
+import Foundation
 import Testing
 @testable import ReleasySender
 
@@ -17,5 +18,14 @@ import Testing
 
   @Test func retryDelayStartsAtOneSecond() {
     #expect(ReleasySender.retryDelay(afterFailedAttempts: 0) == 1)
+  }
+
+  @Test func historyKeepsTheLatestFramesInOrder() {
+    var history = History(capacity: 3)
+    for byte in UInt8(1)...5 {
+      history.append(Data([byte]))
+    }
+
+    #expect(history.frames == [Data([3]), Data([4]), Data([5])])
   }
 }
