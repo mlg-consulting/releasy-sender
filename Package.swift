@@ -22,7 +22,7 @@ let package = Package(
     // Tests
     .testTarget(
       name: "ReleasySenderTests",
-      dependencies: [],
+      dependencies: ["ReleasySender"],
       path: "Tests"
     )
   ]

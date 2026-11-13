@@ -1,6 +1,9 @@
 import Dependencies
 import Foundation
 import Network
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Broadcasts analytics events and console logs to the Releasy instances found on the local network.
 ///
@@ -14,14 +17,32 @@ public actor ReleasySender {
   /// before the browser finds a Releasy, are not lost. The oldest are dropped first.
   static let pendingCapacity = 500
 
+  /// The longest wait between two connection attempts to a Releasy, in seconds.
+  static let maximumRetryDelay: TimeInterval = 30
+
+  /// A connection to a Releasy, identified so that the events of a connection that was replaced,
+  /// such as the `.cancelled` state that follows its cancellation, are ignored.
+  private struct Link {
+    let id: UUID
+    let connection: NWConnection
+  }
+
   private let encoder = JSONEncoder()
   private var browser: NWBrowser?
-  private var connections = [NWEndpoint: NWConnection]()
+  /// The Releasy instances currently advertised on the network.
+  private var advertisedEndpoints = Set<NWEndpoint>()
+  private var links = [NWEndpoint: Link]()
   private var readyEndpoints = Set<NWEndpoint>()
+  /// The number of failed attempts in a row, for each Releasy, which sets the delay before the next one.
+  private var failedAttempts = [NWEndpoint: Int]()
+  private var retryTasks = [NWEndpoint: Task<Void, Never>]()
   private var pending = [Data]()
 
   public init() {
-    Task { await setupBrowser() }
+    Task {
+      await setupBrowser()
+      await observeForeground()
+    }
   }
 
   public func send(_ payload: ReleasyPayload) {
@@ -35,7 +56,7 @@ public actor ReleasySender {
       return
     }
     for endpoint in readyEndpoints {
-      connections[endpoint].map { send(frame, on: $0) }
+      links[endpoint].map { send(frame, on: $0.connection) }
     }
   }
 
@@ -46,6 +67,15 @@ public actor ReleasySender {
       }
     }))
   }
+
+  /// The wait before the attempt following `failedAttempts` failures in a row, in seconds: 1, 2,
+  /// 4, 8 and 16 seconds, then 30 seconds.
+  static func retryDelay(afterFailedAttempts failedAttempts: Int) -> TimeInterval {
+    let seconds = TimeInterval(1 << min(max(failedAttempts - 1, 0), 5))
+    return min(seconds, maximumRetryDelay)
+  }
+
+  // MARK: - Browsing
 
   private func setupBrowser() {
     let browser = NWBrowser(for: .bonjour(type: "_releasy._tcp", domain: nil), using: .tcp)
@@ -75,44 +105,118 @@ public actor ReleasySender {
     for change in changes {
       switch change {
       case .added(let result):
+        advertisedEndpoints.insert(result.endpoint)
         connect(to: result.endpoint)
       case .removed(let result):
-        disconnect(from: result.endpoint)
+        advertisedEndpoints.remove(result.endpoint)
+        forget(result.endpoint)
       default: break
       }
     }
   }
 
+  // MARK: - Connections
+
   private func connect(to endpoint: NWEndpoint) {
-    guard connections[endpoint] == nil else { return }
+    guard links[endpoint] == nil, advertisedEndpoints.contains(endpoint) else { return }
+    let id = uuid()
     let connection = NWConnection(to: endpoint, using: .tcp)
-    connections[endpoint] = connection
-    // The handler captures the endpoint rather than the connection: capturing the connection inside
-    // its own `stateUpdateHandler` retains it forever.
+    links[endpoint] = Link(id: id, connection: connection)
+    // The handler captures the endpoint and the id rather than the connection: capturing the
+    // connection inside its own `stateUpdateHandler` retains it forever.
     connection.stateUpdateHandler = { [weak self] newState in
-      Task { [weak self] in await self?.connectionStateChanged(newState: newState, endpoint: endpoint) }
+      Task { [weak self] in await self?.connectionStateChanged(newState: newState, endpoint: endpoint, id: id) }
     }
     connection.start(queue: .main)
   }
 
+  /// Closes the connection to `endpoint`, if any, without retrying.
   private func disconnect(from endpoint: NWEndpoint) {
     readyEndpoints.remove(endpoint)
-    connections.removeValue(forKey: endpoint)?.cancel()
+    links.removeValue(forKey: endpoint)?.connection.cancel()
   }
 
-  private func connectionStateChanged(newState: NWConnection.State, endpoint: NWEndpoint) {
+  /// Closes the connection to a Releasy that is no longer advertised, and stops retrying it.
+  private func forget(_ endpoint: NWEndpoint) {
+    disconnect(from: endpoint)
+    retryTasks.removeValue(forKey: endpoint)?.cancel()
+    failedAttempts.removeValue(forKey: endpoint)
+  }
+
+  private func connectionStateChanged(newState: NWConnection.State, endpoint: NWEndpoint, id: UUID) {
+    guard let link = links[endpoint], link.id == id else { return }
     switch newState {
     case .ready:
-      guard let connection = connections[endpoint] else { return }
       readyEndpoints.insert(endpoint)
-      pending.forEach { send($0, on: connection) }
+      failedAttempts.removeValue(forKey: endpoint)
+      pending.forEach { send($0, on: link.connection) }
       pending.removeAll()
     case .failed(let error):
       print("Connection failed with \(error)")
-      disconnect(from: endpoint)
+      retry(endpoint)
+    case .waiting(let error):
+      // A waiting connection only tries again when the network changes, which may never happen
+      // while the Releasy is reachable again: retry on schedule instead.
+      print("Connection waiting with \(error)")
+      retry(endpoint)
     case .cancelled:
       disconnect(from: endpoint)
     default: break
+    }
+  }
+
+  /// Closes the connection to `endpoint` and schedules a new attempt, for as long as the Releasy is
+  /// advertised.
+  private func retry(_ endpoint: NWEndpoint) {
+    disconnect(from: endpoint)
+    guard advertisedEndpoints.contains(endpoint), retryTasks[endpoint] == nil else { return }
+    let attempts = failedAttempts[endpoint, default: 0] + 1
+    failedAttempts[endpoint] = attempts
+    let delay = Self.retryDelay(afterFailedAttempts: attempts)
+    retryTasks[endpoint] = Task { [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      } catch {
+        return // Cancelled: the Releasy is no longer advertised.
+      }
+      await self?.retryDelayElapsed(for: endpoint)
+    }
+  }
+
+  private func retryDelayElapsed(for endpoint: NWEndpoint) {
+    retryTasks.removeValue(forKey: endpoint)
+    connect(to: endpoint)
+  }
+
+  // MARK: - Foreground
+
+  /// Reconnects as soon as the application comes back to the foreground: connections opened before
+  /// going to the background are usually dead, and the browser may have stopped.
+  private func observeForeground() {
+#if canImport(UIKit) && !os(watchOS)
+    Task { [weak self] in
+      for await _ in NotificationCenter.default.notifications(named: UIApplication.willEnterForegroundNotification) {
+        guard let self else { return }
+        await applicationWillEnterForeground()
+      }
+    }
+#endif
+  }
+
+  private func applicationWillEnterForeground() {
+    guard browser != nil else {
+      // The browser stopped, so the advertised instances may be stale: start over from what a new
+      // browser finds, which it reports as added.
+      advertisedEndpoints.forEach(forget)
+      advertisedEndpoints.removeAll()
+      setupBrowser()
+      return
+    }
+    for endpoint in advertisedEndpoints where !readyEndpoints.contains(endpoint) {
+      retryTasks.removeValue(forKey: endpoint)?.cancel()
+      failedAttempts.removeValue(forKey: endpoint)
+      disconnect(from: endpoint)
+      connect(to: endpoint)
     }
   }
 }
