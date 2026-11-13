@@ -120,7 +120,7 @@ public actor ReleasySender {
   private func connect(to endpoint: NWEndpoint) {
     guard links[endpoint] == nil, advertisedEndpoints.contains(endpoint) else { return }
     let id = uuid()
-    let connection = NWConnection(to: endpoint, using: .tcp)
+    let connection = NWConnection(to: endpoint, using: .releasy)
     links[endpoint] = Link(id: id, connection: connection)
     // The handler captures the endpoint and the id rather than the connection: capturing the
     // connection inside its own `stateUpdateHandler` retains it forever.
@@ -218,6 +218,28 @@ public actor ReleasySender {
       disconnect(from: endpoint)
       connect(to: endpoint)
     }
+  }
+}
+
+extension NWParameters {
+  /// TCP parameters that notice a vanished Releasy, such as a Mac gone to sleep or off the network,
+  /// instead of keeping a dead connection.
+  static var releasy: NWParameters {
+    let tcp = NWProtocolTCP.Options()
+    // Send each small log right away rather than waiting to batch it.
+    tcp.noDelay = true
+    // Give up on a Releasy that doesn't answer within 10 seconds.
+    tcp.connectionTimeout = 10
+    // Drop the connection when sent logs stay unacknowledged for 15 seconds: the keepalive below
+    // only probes an idle connection, and the application keeps sending.
+    tcp.connectionDropTime = 15
+    // Probe an idle connection after 10 seconds, then every 5 seconds, and drop it after 3 probes
+    // without answer, about 25 seconds in all.
+    tcp.enableKeepalive = true
+    tcp.keepaliveIdle = 10
+    tcp.keepaliveInterval = 5
+    tcp.keepaliveCount = 3
+    return NWParameters(tls: nil, tcp: tcp)
   }
 }
 
