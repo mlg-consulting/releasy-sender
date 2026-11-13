@@ -133,6 +133,22 @@ extension ReleasySender {
     let buildNumber: String
     let content: Content
 
+    public init(
+      id: UUID,
+      bundleId: String,
+      deviceId: String,
+      timestamp: TimeInterval,
+      buildNumber: String,
+      content: Content
+    ) {
+      self.id = id
+      self.bundleId = bundleId
+      self.deviceId = deviceId
+      self.timestamp = timestamp
+      self.buildNumber = buildNumber
+      self.content = content
+    }
+
     private enum CodingKeys: String, CodingKey {
       case v, kind, id, deviceId, bundleId, buildNumber, timestamp
       case level, category, method, message
