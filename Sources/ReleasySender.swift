@@ -79,7 +79,10 @@ public actor ReleasySender {
   // MARK: - Browsing
 
   private func setupBrowser() {
-    let browser = NWBrowser(for: .bonjour(type: "_releasy._tcp", domain: nil), using: .tcp)
+    let parameters = NWParameters.tcp
+    // Also find a Releasy over a direct iPhone–Mac link (AWDL), when they share no Wi-Fi network.
+    parameters.includePeerToPeer = true
+    let browser = NWBrowser(for: .bonjour(type: "_releasy._tcp", domain: nil), using: parameters)
     browser.stateUpdateHandler = { [weak self] newState in
       Task { [weak self] in await self?.browserStateChanged(newState: newState) }
     }
@@ -256,7 +259,10 @@ extension NWParameters {
     tcp.keepaliveIdle = 10
     tcp.keepaliveInterval = 5
     tcp.keepaliveCount = 3
-    return NWParameters(tls: nil, tcp: tcp)
+    let parameters = NWParameters(tls: nil, tcp: tcp)
+    // Reach a Releasy found over a direct iPhone–Mac link (AWDL) as well as over the Wi-Fi network.
+    parameters.includePeerToPeer = true
+    return parameters
   }
 }
 
