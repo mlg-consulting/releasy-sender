@@ -61,31 +61,50 @@ import Testing
   }
 }
 
-@Suite struct ReleasyPayloadTests {
-  let payload = ReleasySender.ReleasyPayload(
-    id: UUID(uuidString: "8A1F0C55-9D2E-4B7A-A3C1-1E2F3A4B5C6D")!,
-    bundleId: "com.app",
+@Suite struct ReleasyMessageTests {
+  let device = ReleasyDevice(
     deviceId: "device",
-    modelName: "iPhone17,1",
-    systemVersion: "26.1",
-    timestamp: 0,
+    bundleId: "com.app",
     buildNumber: "42",
-    content: .console(level: "info", category: "", method: "", message: "Hello")
+    modelName: "iPhone17,1",
+    systemVersion: "26.1"
   )
 
-  @Test func encodesDeviceNameWhenPaired() throws {
-    var named = payload
-    named.deviceName = "iPhone QA 1"
-
-    let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(named)) as? [String: Any])
-
-    #expect(json["deviceName"] as? String == "iPhone QA 1")
-    #expect(json["user"] == nil)
+  func json(_ message: some Encodable) throws -> [String: Any] {
+    try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: Any])
   }
 
-  @Test func leavesDeviceNameOutWhenUnpaired() throws {
-    let json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as? [String: Any])
+  @Test func logCarriesTheApplicationButNotTheDeviceDescription() throws {
+    let payload = ReleasySender.ReleasyPayload(
+      id: UUID(uuidString: "8A1F0C55-9D2E-4B7A-A3C1-1E2F3A4B5C6D")!,
+      timestamp: 3,
+      content: .console(level: "info", category: "Network", method: "fetch()", message: "Hello")
+    )
 
-    #expect(json["deviceName"] == nil)
+    let json = try json(LogMessage(payload: payload, device: device))
+
+    #expect(json["kind"] as? String == "console")
+    #expect(json["id"] as? String == "8A1F0C55-9D2E-4B7A-A3C1-1E2F3A4B5C6D")
+    #expect(json["deviceId"] as? String == "device")
+    #expect(json["bundleId"] as? String == "com.app")
+    #expect(json["buildNumber"] as? String == "42")
+    #expect(json["message"] as? String == "Hello")
+    for key in ["modelName", "systemVersion", "deviceName", "user"] {
+      #expect(json[key] == nil)
+    }
+  }
+
+  @Test func helloDescribesTheDevice() throws {
+    let json = try json(HelloMessage(device: device, deviceName: "iPhone QA 1", timestamp: 10))
+
+    #expect(json["v"] as? Int == 1)
+    #expect(json["kind"] as? String == "hello")
+    #expect(json["deviceId"] as? String == "device")
+    #expect(json["bundleId"] as? String == "com.app")
+    #expect(json["buildNumber"] as? String == "42")
+    #expect(json["modelName"] as? String == "iPhone17,1")
+    #expect(json["systemVersion"] as? String == "26.1")
+    #expect(json["deviceName"] as? String == "iPhone QA 1")
+    #expect(json["timestamp"] as? Double == 10)
   }
 }
