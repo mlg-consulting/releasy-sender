@@ -5,10 +5,13 @@ import Network
 import UIKit
 #endif
 
-/// Broadcasts analytics events and console logs to the Releasy instances found on the local network.
+/// Sends analytics events and console logs to the Releasy the application is paired with, found on
+/// the local network.
 ///
-/// Each payload is a JSON object (protocol version 1) terminated by a `\0` byte, sent over TCP to
-/// every `_releasy._tcp` Bonjour service.
+/// Nothing is sent until `pair(with:)` receives the pairing Releasy shows as a QR code (see
+/// `ReleasyPairing`). Each payload
+/// is then a JSON object (protocol version 1) terminated by a `\0` byte, sent over TLS with the
+/// pairing's pre-shared key to the `_releasy._tcp` Bonjour service advertising the paired Mac.
 public actor ReleasySender {
   @Dependency(\.date.now) var now
   @Dependency(\.uuid) var uuid
@@ -24,6 +27,9 @@ public actor ReleasySender {
   /// The longest wait between two connection attempts to a Releasy, in seconds.
   static let maximumRetryDelay: TimeInterval = 30
 
+  /// The user defaults key the pairing is stored under.
+  static let pairingKey = "releasy.pairing"
+
   /// A connection to a Releasy, identified so that the events of a connection that was replaced,
   /// such as the `.cancelled` state that follows its cancellation, are ignored.
   private struct Link {
@@ -36,14 +42,18 @@ public actor ReleasySender {
   /// that sending logs doesn't take time from the application's interface.
   private let queue = DispatchQueue(label: "com.releasy.sender", qos: .utility)
   private var browser: NWBrowser?
-  /// The Releasy instances currently advertised on the network.
+  /// The Releasy the application is paired with, kept across launches. `nil` until paired.
+  public private(set) var pairing: ReleasyPairing? = ReleasySender.storedPairing()
+  /// The identifier of the Mac each Releasy advertised on the network runs on.
+  private var advertisedMacIds = [NWEndpoint: String]()
+  /// The advertised Releasy instances running on the paired Mac: the only ones connected to.
   private var advertisedEndpoints = Set<NWEndpoint>()
   private var links = [NWEndpoint: Link]()
   private var readyEndpoints = Set<NWEndpoint>()
   /// The number of failed attempts in a row, for each Releasy, which sets the delay before the next one.
   private var failedAttempts = [NWEndpoint: Int]()
   private var retryTasks = [NWEndpoint: Task<Void, Never>]()
-  private var history = History(capacity: historyCapacity)
+  private var history = History<ReleasyPayload>(capacity: historyCapacity)
 
   public init() {
     Task {
@@ -52,13 +62,36 @@ public actor ReleasySender {
     }
   }
 
+  /// Pairs the application with the Releasy that showed `pairing`, and connects to it. The
+  /// connections to a Releasy paired before are closed.
+  public func pair(with pairing: ReleasyPairing) {
+    self.pairing = pairing
+    UserDefaults.standard.set(try? JSONEncoder().encode(pairing), forKey: Self.pairingKey)
+    restartConnections()
+  }
+
+  /// Stops sending to the paired Releasy.
+  public func unpair() {
+    pairing = .none
+    UserDefaults.standard.removeObject(forKey: Self.pairingKey)
+    restartConnections()
+  }
+
   public func send(_ payload: ReleasyPayload) {
-    guard let data = try? encoder.encode(payload) else { return }
-    let frame = data + Data([0x00])
-    history.append(frame)
+    history.append(payload)
+    guard let frame = frame(for: payload) else { return }
     for endpoint in readyEndpoints {
       links[endpoint].map { send(frame, on: $0.connection) }
     }
+  }
+
+  /// The payload as sent, named after the paired device. Encoded when sent rather than when
+  /// received, so that the logs kept from before pairing carry the name too.
+  private func frame(for payload: ReleasyPayload) -> Data? {
+    var payload = payload
+    payload.deviceName = pairing?.deviceName
+    guard let data = try? encoder.encode(payload) else { return nil }
+    return data + Data([0x00])
   }
 
   public func send(_ frame: Data, on connection: NWConnection) {
@@ -82,7 +115,8 @@ public actor ReleasySender {
     let parameters = NWParameters.tcp
     // Also find a Releasy over a direct iPhone–Mac link (AWDL), when they share no Wi-Fi network.
     parameters.includePeerToPeer = true
-    let browser = NWBrowser(for: .bonjour(type: "_releasy._tcp", domain: nil), using: parameters)
+    // The TXT record tells which Mac each Releasy runs on.
+    let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_releasy._tcp", domain: nil), using: parameters)
     browser.stateUpdateHandler = { [weak self] newState in
       Task { [weak self] in await self?.browserStateChanged(newState: newState) }
     }
@@ -108,23 +142,47 @@ public actor ReleasySender {
   private func browseResultsChanged(changes: Set<NWBrowser.Result.Change>) {
     for change in changes {
       switch change {
-      case .added(let result):
-        advertisedEndpoints.insert(result.endpoint)
-        connect(to: result.endpoint)
+      case .added(let result), .changed(_, let result, _):
+        if case .bonjour(let txtRecord) = result.metadata, let macId = txtRecord["id"] {
+          advertisedMacIds[result.endpoint] = macId
+        } else {
+          advertisedMacIds.removeValue(forKey: result.endpoint)
+        }
+        refresh(result.endpoint)
       case .removed(let result):
-        advertisedEndpoints.remove(result.endpoint)
-        forget(result.endpoint)
+        advertisedMacIds.removeValue(forKey: result.endpoint)
+        refresh(result.endpoint)
       default: break
       }
     }
   }
 
+  /// Connects to an advertised Releasy running on the paired Mac, and forgets any other.
+  private func refresh(_ endpoint: NWEndpoint) {
+    if let pairing, advertisedMacIds[endpoint] == pairing.macId {
+      advertisedEndpoints.insert(endpoint)
+      connect(to: endpoint)
+    } else {
+      advertisedEndpoints.remove(endpoint)
+      forget(endpoint)
+    }
+  }
+
+  /// Closes every connection, which uses the previous pairing, and connects again with the current one.
+  private func restartConnections() {
+    for endpoint in Set(links.keys).union(retryTasks.keys) {
+      forget(endpoint)
+    }
+    advertisedEndpoints.removeAll()
+    advertisedMacIds.keys.forEach(refresh)
+  }
+
   // MARK: - Connections
 
   private func connect(to endpoint: NWEndpoint) {
-    guard links[endpoint] == nil, advertisedEndpoints.contains(endpoint) else { return }
+    guard links[endpoint] == nil, advertisedEndpoints.contains(endpoint), let pairing else { return }
     let id = uuid()
-    let connection = NWConnection(to: endpoint, using: .releasy)
+    let connection = NWConnection(to: endpoint, using: .releasy(pairing: pairing))
     links[endpoint] = Link(id: id, connection: connection)
     // The handler captures the endpoint and the id rather than the connection: capturing the
     // connection inside its own `stateUpdateHandler` retains it forever.
@@ -153,7 +211,7 @@ public actor ReleasySender {
     case .ready:
       readyEndpoints.insert(endpoint)
       failedAttempts.removeValue(forKey: endpoint)
-      history.frames.forEach { send($0, on: link.connection) }
+      history.elements.compactMap(frame(for:)).forEach { send($0, on: link.connection) }
     case .failed(let error):
       print("Connection failed with \(error)")
       retry(endpoint)
@@ -212,6 +270,7 @@ public actor ReleasySender {
       // browser finds, which it reports as added.
       advertisedEndpoints.forEach(forget)
       advertisedEndpoints.removeAll()
+      advertisedMacIds.removeAll()
       setupBrowser()
       return
     }
@@ -224,27 +283,33 @@ public actor ReleasySender {
   }
 }
 
-/// The latest frames, in sending order, up to a capacity: the oldest are dropped first.
-struct History {
+extension ReleasySender {
+  private static func storedPairing() -> ReleasyPairing? {
+    UserDefaults.standard.data(forKey: pairingKey).flatMap { try? JSONDecoder().decode(ReleasyPairing.self, from: $0) }
+  }
+}
+
+/// The latest elements, in sending order, up to a capacity: the oldest are dropped first.
+struct History<Element> {
   let capacity: Int
-  private(set) var frames: [Data] = []
+  private(set) var elements: [Element] = []
 
   init(capacity: Int) {
     self.capacity = capacity
   }
 
-  mutating func append(_ frame: Data) {
-    frames.append(frame)
-    if frames.count > capacity {
-      frames.removeFirst(frames.count - capacity)
+  mutating func append(_ element: Element) {
+    elements.append(element)
+    if elements.count > capacity {
+      elements.removeFirst(elements.count - capacity)
     }
   }
 }
 
 extension NWParameters {
-  /// TCP parameters that notice a vanished Releasy, such as a Mac gone to sleep or off the network,
-  /// instead of keeping a dead connection.
-  static var releasy: NWParameters {
+  /// TLS-PSK parameters with the pairing's key, and TCP parameters that notice a vanished Releasy,
+  /// such as a Mac gone to sleep or off the network, instead of keeping a dead connection.
+  static func releasy(pairing: ReleasyPairing) -> NWParameters {
     let tcp = NWProtocolTCP.Options()
     // Send each small log right away rather than waiting to batch it.
     tcp.noDelay = true
@@ -259,7 +324,7 @@ extension NWParameters {
     tcp.keepaliveIdle = 10
     tcp.keepaliveInterval = 5
     tcp.keepaliveCount = 3
-    let parameters = NWParameters(tls: nil, tcp: tcp)
+    let parameters = NWParameters(tls: pairing.tlsOptions, tcp: tcp)
     // Reach a Releasy found over a direct iPhone–Mac link (AWDL) as well as over the Wi-Fi network.
     parameters.includePeerToPeer = true
     return parameters
@@ -281,8 +346,9 @@ extension ReleasySender {
     let deviceId: String
     let timestamp: TimeInterval
     let buildNumber: String
-    let user: String
     let content: Content
+    /// The name given to the device when pairing it, set by the sender from the pairing.
+    var deviceName: String?
 
     public init(
       id: UUID,
@@ -292,7 +358,6 @@ extension ReleasySender {
       systemVersion: String,
       timestamp: TimeInterval,
       buildNumber: String,
-      user: String,
       content: Content
     ) {
       self.id = id
@@ -302,12 +367,11 @@ extension ReleasySender {
       self.systemVersion = systemVersion
       self.timestamp = timestamp
       self.buildNumber = buildNumber
-      self.user = user
       self.content = content
     }
 
     private enum CodingKeys: String, CodingKey {
-      case v, kind, id, deviceId, modelName, systemVersion, bundleId, buildNumber, user, timestamp
+      case v, kind, id, deviceId, modelName, systemVersion, bundleId, buildNumber, deviceName, timestamp
       case level, category, method, message
       case name, params
     }
@@ -321,7 +385,7 @@ extension ReleasySender {
       try container.encode(systemVersion, forKey: .systemVersion)
       try container.encode(bundleId, forKey: .bundleId)
       try container.encode(buildNumber, forKey: .buildNumber)
-      try container.encode(user, forKey: .user)
+      try container.encodeIfPresent(deviceName, forKey: .deviceName)
       try container.encode(timestamp, forKey: .timestamp)
       switch content {
       case let .analytics(name, params):
