@@ -2,16 +2,19 @@ import CryptoKit
 import Foundation
 import Network
 
-/// What the application needs to send its logs to a Releasy: the identifier of the Mac, and the
-/// secret that encrypts the connection.
+/// What the application needs to send its logs to a Releasy: the identifier of the Mac, the secret
+/// that encrypts the connection, and the name the device is listed under.
 ///
-/// Releasy shows it as a QR code of a link such as `releasy-com.app://pair?mac=…&secret=…`. The
+/// Releasy shows it as a QR code of a link such as `releasy-com.app://pair?mac=…&secret=…&name=…`. The
 /// application registers its `urlScheme`, creates the pairing from the link it opens, and hands it
 /// to `ReleasySender.pair(with:)`.
 public struct ReleasyPairing: Codable, Equatable, Sendable {
   /// The identifier the paired Releasy advertises in the TXT record of its Bonjour service.
   public let macId: String
   let secret: String
+  /// The name given to the device in Releasy, such as `iPhone QA 1`, sent with every log so that
+  /// Releasy lists the device under it.
+  public let deviceName: String
 
   /// The URL scheme the application registers (`CFBundleURLTypes`) to receive its pairing link,
   /// such as `releasy-com.pictarine.photo-print` for the bundle identifier
@@ -27,20 +30,22 @@ public struct ReleasyPairing: Codable, Equatable, Sendable {
     "releasy-" + bundleId.lowercased()
   }
 
-  /// Reads a pairing link. `nil` when it isn't one, or doesn't hold both the Mac identifier and
-  /// the secret.
+  /// Reads a pairing link. `nil` when it isn't one, or doesn't hold the Mac identifier, the secret
+  /// and the device name.
   public init?(url: URL) {
     let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
     guard
       url.scheme?.lowercased().hasPrefix("releasy-") == true,
       url.host == "pair",
       let macId = items.first(where: { $0.name == "mac" })?.value, !macId.isEmpty,
-      let secret = items.first(where: { $0.name == "secret" })?.value, !secret.isEmpty
+      let secret = items.first(where: { $0.name == "secret" })?.value, !secret.isEmpty,
+      let deviceName = items.first(where: { $0.name == "name" })?.value, !deviceName.isEmpty
     else {
       return nil
     }
     self.macId = macId
     self.secret = secret
+    self.deviceName = deviceName
   }
 }
 

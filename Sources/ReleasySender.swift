@@ -53,7 +53,7 @@ public actor ReleasySender {
   /// The number of failed attempts in a row, for each Releasy, which sets the delay before the next one.
   private var failedAttempts = [NWEndpoint: Int]()
   private var retryTasks = [NWEndpoint: Task<Void, Never>]()
-  private var history = History(capacity: historyCapacity)
+  private var history = History<ReleasyPayload>(capacity: historyCapacity)
 
   public init() {
     Task {
@@ -78,12 +78,20 @@ public actor ReleasySender {
   }
 
   public func send(_ payload: ReleasyPayload) {
-    guard let data = try? encoder.encode(payload) else { return }
-    let frame = data + Data([0x00])
-    history.append(frame)
+    history.append(payload)
+    guard let frame = frame(for: payload) else { return }
     for endpoint in readyEndpoints {
       links[endpoint].map { send(frame, on: $0.connection) }
     }
+  }
+
+  /// The payload as sent, named after the paired device. Encoded when sent rather than when
+  /// received, so that the logs kept from before pairing carry the name too.
+  private func frame(for payload: ReleasyPayload) -> Data? {
+    var payload = payload
+    payload.deviceName = pairing?.deviceName
+    guard let data = try? encoder.encode(payload) else { return nil }
+    return data + Data([0x00])
   }
 
   public func send(_ frame: Data, on connection: NWConnection) {
@@ -203,7 +211,7 @@ public actor ReleasySender {
     case .ready:
       readyEndpoints.insert(endpoint)
       failedAttempts.removeValue(forKey: endpoint)
-      history.frames.forEach { send($0, on: link.connection) }
+      history.elements.compactMap(frame(for:)).forEach { send($0, on: link.connection) }
     case .failed(let error):
       print("Connection failed with \(error)")
       retry(endpoint)
@@ -281,19 +289,19 @@ extension ReleasySender {
   }
 }
 
-/// The latest frames, in sending order, up to a capacity: the oldest are dropped first.
-struct History {
+/// The latest elements, in sending order, up to a capacity: the oldest are dropped first.
+struct History<Element> {
   let capacity: Int
-  private(set) var frames: [Data] = []
+  private(set) var elements: [Element] = []
 
   init(capacity: Int) {
     self.capacity = capacity
   }
 
-  mutating func append(_ frame: Data) {
-    frames.append(frame)
-    if frames.count > capacity {
-      frames.removeFirst(frames.count - capacity)
+  mutating func append(_ element: Element) {
+    elements.append(element)
+    if elements.count > capacity {
+      elements.removeFirst(elements.count - capacity)
     }
   }
 }
@@ -338,8 +346,9 @@ extension ReleasySender {
     let deviceId: String
     let timestamp: TimeInterval
     let buildNumber: String
-    let user: String
     let content: Content
+    /// The name given to the device when pairing it, set by the sender from the pairing.
+    var deviceName: String?
 
     public init(
       id: UUID,
@@ -349,7 +358,6 @@ extension ReleasySender {
       systemVersion: String,
       timestamp: TimeInterval,
       buildNumber: String,
-      user: String,
       content: Content
     ) {
       self.id = id
@@ -359,12 +367,11 @@ extension ReleasySender {
       self.systemVersion = systemVersion
       self.timestamp = timestamp
       self.buildNumber = buildNumber
-      self.user = user
       self.content = content
     }
 
     private enum CodingKeys: String, CodingKey {
-      case v, kind, id, deviceId, modelName, systemVersion, bundleId, buildNumber, user, timestamp
+      case v, kind, id, deviceId, modelName, systemVersion, bundleId, buildNumber, deviceName, timestamp
       case level, category, method, message
       case name, params
     }
@@ -378,7 +385,7 @@ extension ReleasySender {
       try container.encode(systemVersion, forKey: .systemVersion)
       try container.encode(bundleId, forKey: .bundleId)
       try container.encode(buildNumber, forKey: .buildNumber)
-      try container.encode(user, forKey: .user)
+      try container.encodeIfPresent(deviceName, forKey: .deviceName)
       try container.encode(timestamp, forKey: .timestamp)
       switch content {
       case let .analytics(name, params):
