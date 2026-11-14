@@ -9,9 +9,10 @@ import UIKit
 /// the local network.
 ///
 /// Nothing is sent until `pair(with:)` receives the pairing Releasy shows as a QR code (see
-/// `ReleasyPairing`). Each payload
-/// is then a JSON object (protocol version 1) terminated by a `\0` byte, sent over TLS with the
-/// pairing's pre-shared key to the `_releasy._tcp` Bonjour service advertising the paired Mac.
+/// `ReleasyPairing`). Each connection, over TLS with the pairing's pre-shared key to the
+/// `_releasy._tcp` Bonjour service advertising the paired Mac, then opens with a `hello` message
+/// describing the device, followed by the logs: JSON objects (protocol version 1), each terminated
+/// by a `\0` byte.
 public actor ReleasySender {
   @Dependency(\.date.now) var now
   @Dependency(\.uuid) var uuid
@@ -54,8 +55,11 @@ public actor ReleasySender {
   private var failedAttempts = [NWEndpoint: Int]()
   private var retryTasks = [NWEndpoint: Task<Void, Never>]()
   private var history = History<ReleasyPayload>(capacity: historyCapacity)
+  private let device: ReleasyDevice
 
-  public init() {
+  /// - Parameter device: The device the application runs on, described to Releasy when connecting.
+  public init(device: ReleasyDevice) {
+    self.device = device
     Task {
       await setupBrowser()
       await observeForeground()
@@ -85,12 +89,17 @@ public actor ReleasySender {
     }
   }
 
-  /// The payload as sent, named after the paired device. Encoded when sent rather than when
-  /// received, so that the logs kept from before pairing carry the name too.
   private func frame(for payload: ReleasyPayload) -> Data? {
-    var payload = payload
-    payload.deviceName = pairing?.deviceName
-    guard let data = try? encoder.encode(payload) else { return nil }
+    frame(LogMessage(payload: payload, device: device))
+  }
+
+  /// The `hello` message, with the current name of the paired device.
+  private func helloFrame() -> Data? {
+    frame(HelloMessage(device: device, deviceName: pairing?.deviceName, timestamp: now.timeIntervalSince1970))
+  }
+
+  private func frame(_ message: some Encodable) -> Data? {
+    guard let data = try? encoder.encode(message) else { return nil }
     return data + Data([0x00])
   }
 
@@ -211,7 +220,8 @@ public actor ReleasySender {
     case .ready:
       readyEndpoints.insert(endpoint)
       failedAttempts.removeValue(forKey: endpoint)
-      history.elements.compactMap(frame(for:)).forEach { send($0, on: link.connection) }
+      // The hello first, so that Releasy describes the logs that follow with it.
+      ([helloFrame()] + history.elements.map(frame(for:))).compactMap { $0 }.forEach { send($0, on: link.connection) }
     case .failed(let error):
       print("Connection failed with \(error)")
       retry(endpoint)
@@ -332,73 +342,99 @@ extension NWParameters {
 }
 
 extension ReleasySender {
-  /// A log as sent to Releasy, in protocol version 1.
-  public struct ReleasyPayload: Encodable, Sendable {
+  /// A log as sent to Releasy, in protocol version 1. The device it comes from is described once,
+  /// in the `hello` message that opens each connection, rather than in every log.
+  public struct ReleasyPayload: Sendable {
     public enum Content: Sendable {
       case analytics(name: String, params: Codable & Sendable)
       case console(level: String, category: String, method: String, message: String)
     }
 
     let id: UUID
-    let bundleId: String
-    let modelName: String
-    let systemVersion: String
-    let deviceId: String
     let timestamp: TimeInterval
-    let buildNumber: String
     let content: Content
-    /// The name given to the device when pairing it, set by the sender from the pairing.
-    var deviceName: String?
 
-    public init(
-      id: UUID,
-      bundleId: String,
-      deviceId: String,
-      modelName: String,
-      systemVersion: String,
-      timestamp: TimeInterval,
-      buildNumber: String,
-      content: Content
-    ) {
+    public init(id: UUID, timestamp: TimeInterval, content: Content) {
       self.id = id
-      self.bundleId = bundleId
-      self.deviceId = deviceId
-      self.modelName = modelName
-      self.systemVersion = systemVersion
       self.timestamp = timestamp
-      self.buildNumber = buildNumber
       self.content = content
     }
+  }
+}
 
-    private enum CodingKeys: String, CodingKey {
-      case v, kind, id, deviceId, modelName, systemVersion, bundleId, buildNumber, deviceName, timestamp
-      case level, category, method, message
-      case name, params
-    }
+/// The device the application runs on, described to Releasy when connecting.
+public struct ReleasyDevice: Equatable, Sendable {
+  /// Identifies the device, such as its `identifierForVendor`.
+  public let deviceId: String
+  public let bundleId: String
+  public let buildNumber: String
+  /// The device model identifier, such as `iPhone17,1`.
+  public let modelName: String
+  public let systemVersion: String
 
-    public func encode(to encoder: any Encoder) throws {
-      var container = encoder.container(keyedBy: CodingKeys.self)
-      try container.encode(1, forKey: .v)
-      try container.encode(id, forKey: .id)
-      try container.encode(deviceId, forKey: .deviceId)
-      try container.encode(modelName, forKey: .modelName)
-      try container.encode(systemVersion, forKey: .systemVersion)
-      try container.encode(bundleId, forKey: .bundleId)
-      try container.encode(buildNumber, forKey: .buildNumber)
-      try container.encodeIfPresent(deviceName, forKey: .deviceName)
-      try container.encode(timestamp, forKey: .timestamp)
-      switch content {
-      case let .analytics(name, params):
-        try container.encode("analytics", forKey: .kind)
-        try container.encode(name, forKey: .name)
-        try container.encode(params, forKey: .params)
-      case let .console(level, category, method, message):
-        try container.encode("console", forKey: .kind)
-        try container.encode(level, forKey: .level)
-        try container.encode(category, forKey: .category)
-        try container.encode(method, forKey: .method)
-        try container.encode(message, forKey: .message)
-      }
+  public init(deviceId: String, bundleId: String, buildNumber: String, modelName: String, systemVersion: String) {
+    self.deviceId = deviceId
+    self.bundleId = bundleId
+    self.buildNumber = buildNumber
+    self.modelName = modelName
+    self.systemVersion = systemVersion
+  }
+}
+
+private enum CodingKeys: String, CodingKey {
+  case v, kind, id, deviceId, bundleId, buildNumber, timestamp
+  case modelName, systemVersion, deviceName
+  case level, category, method, message
+  case name, params
+}
+
+/// A log on the wire: the payload, with the device and the application it comes from so that
+/// Releasy can tell the logs of several applications apart.
+struct LogMessage: Encodable {
+  let payload: ReleasySender.ReleasyPayload
+  let device: ReleasyDevice
+
+  func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(1, forKey: .v)
+    try container.encode(payload.id, forKey: .id)
+    try container.encode(device.deviceId, forKey: .deviceId)
+    try container.encode(device.bundleId, forKey: .bundleId)
+    try container.encode(device.buildNumber, forKey: .buildNumber)
+    try container.encode(payload.timestamp, forKey: .timestamp)
+    switch payload.content {
+    case let .analytics(name, params):
+      try container.encode("analytics", forKey: .kind)
+      try container.encode(name, forKey: .name)
+      try container.encode(params, forKey: .params)
+    case let .console(level, category, method, message):
+      try container.encode("console", forKey: .kind)
+      try container.encode(level, forKey: .level)
+      try container.encode(category, forKey: .category)
+      try container.encode(method, forKey: .method)
+      try container.encode(message, forKey: .message)
     }
+  }
+}
+
+/// The message opening each connection, describing the device so that Releasy lists it before its
+/// first log and doesn't need the description in every log.
+struct HelloMessage: Encodable {
+  let device: ReleasyDevice
+  /// The name given to the device when pairing it.
+  let deviceName: String?
+  let timestamp: TimeInterval
+
+  func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(1, forKey: .v)
+    try container.encode("hello", forKey: .kind)
+    try container.encode(device.deviceId, forKey: .deviceId)
+    try container.encode(device.bundleId, forKey: .bundleId)
+    try container.encode(device.buildNumber, forKey: .buildNumber)
+    try container.encode(timestamp, forKey: .timestamp)
+    try container.encode(device.modelName, forKey: .modelName)
+    try container.encode(device.systemVersion, forKey: .systemVersion)
+    try container.encodeIfPresent(deviceName, forKey: .deviceName)
   }
 }
