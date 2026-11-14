@@ -5,19 +5,34 @@ import Network
 /// What the application needs to send its logs to a Releasy: the identifier of the Mac, and the
 /// secret that encrypts the connection.
 ///
-/// Releasy shows it as a QR code of a link such as `releasy://pair?mac=…&secret=…`. The application
-/// registers the `releasy` URL scheme, creates the pairing from the link it opens, and hands it to
-/// `ReleasySender.pair(with:)`.
+/// Releasy shows it as a QR code of a link such as `releasy-com.app://pair?mac=…&secret=…`. The
+/// application registers its `urlScheme`, creates the pairing from the link it opens, and hands it
+/// to `ReleasySender.pair(with:)`.
 public struct ReleasyPairing: Codable, Equatable, Sendable {
   /// The identifier the paired Releasy advertises in the TXT record of its Bonjour service.
   public let macId: String
   let secret: String
 
-  /// Reads a pairing link, whatever its scheme. `nil` when it doesn't hold both the Mac identifier
-  /// and the secret.
+  /// The URL scheme the application registers (`CFBundleURLTypes`) to receive its pairing link,
+  /// such as `releasy-com.pictarine.photo-print` for the bundle identifier
+  /// `com.pictarine.photo-print`.
+  ///
+  /// One scheme per application rather than a shared one: iOS opens a link whose scheme several
+  /// installed applications register with any of them, and test devices hold several applications.
+  public static var urlScheme: String {
+    urlScheme(bundleId: Bundle.main.bundleIdentifier ?? "")
+  }
+
+  static func urlScheme(bundleId: String) -> String {
+    "releasy-" + bundleId.lowercased()
+  }
+
+  /// Reads a pairing link. `nil` when it isn't one, or doesn't hold both the Mac identifier and
+  /// the secret.
   public init?(url: URL) {
     let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
     guard
+      url.scheme?.lowercased().hasPrefix("releasy-") == true,
       url.host == "pair",
       let macId = items.first(where: { $0.name == "mac" })?.value, !macId.isEmpty,
       let secret = items.first(where: { $0.name == "secret" })?.value, !secret.isEmpty

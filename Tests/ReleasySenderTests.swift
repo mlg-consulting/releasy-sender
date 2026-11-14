@@ -32,18 +32,23 @@ import Testing
 
 @Suite struct ReleasyPairingTests {
   @Test func readsPairingLink() throws {
-    let url = try #require(URL(string: "releasy://pair?mac=8A1F0C55-9D2E-4B7A-A3C1-1E2F3A4B5C6D&secret=a-b_c"))
+    let url = try #require(URL(string: "releasy-com.app://pair?mac=8A1F0C55-9D2E-4B7A-A3C1-1E2F3A4B5C6D&secret=a-b_c"))
     let pairing = try #require(ReleasyPairing(url: url))
 
     #expect(pairing.macId == "8A1F0C55-9D2E-4B7A-A3C1-1E2F3A4B5C6D")
     #expect(pairing.secret == "a-b_c")
   }
 
+  @Test func urlSchemeFollowsBundleIdentifier() {
+    #expect(ReleasyPairing.urlScheme(bundleId: "com.Pictarine.photo-print") == "releasy-com.pictarine.photo-print")
+  }
+
   @Test(arguments: [
-    "releasy://pair?mac=mac",
-    "releasy://pair?secret=secret",
-    "releasy://pair?mac=&secret=secret",
-    "releasy://other?mac=mac&secret=secret",
+    "releasy-com.app://pair?mac=mac",
+    "releasy-com.app://pair?secret=secret",
+    "releasy-com.app://pair?mac=&secret=secret",
+    "releasy-com.app://other?mac=mac&secret=secret",
+    "picta://pair?mac=mac&secret=secret",
     "https://example.com"
   ])
   func ignoresOtherLinks(link: String) throws {

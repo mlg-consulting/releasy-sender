@@ -8,7 +8,8 @@ import UIKit
 /// Sends analytics events and console logs to the Releasy the application is paired with, found on
 /// the local network.
 ///
-/// Nothing is sent until `pair(with:)` receives the pairing Releasy shows as a QR code. Each payload
+/// Nothing is sent until `pair(with:)` receives the pairing Releasy shows as a QR code (see
+/// `ReleasyPairing`). Each payload
 /// is then a JSON object (protocol version 1) terminated by a `\0` byte, sent over TLS with the
 /// pairing's pre-shared key to the `_releasy._tcp` Bonjour service advertising the paired Mac.
 public actor ReleasySender {
