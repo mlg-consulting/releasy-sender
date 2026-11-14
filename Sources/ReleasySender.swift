@@ -36,6 +36,8 @@ public actor ReleasySender {
   private struct Link {
     let id: UUID
     let connection: NWConnection
+    /// The frames waiting for the connection to process the ones handed to it.
+    var sendQueue = SendQueue()
   }
 
   private let encoder = JSONEncoder()
@@ -85,7 +87,7 @@ public actor ReleasySender {
     history.append(payload)
     guard let frame = frame(for: payload) else { return }
     for endpoint in readyEndpoints {
-      links[endpoint].map { send(frame, on: $0.connection) }
+      send(frame, to: endpoint)
     }
   }
 
@@ -103,12 +105,29 @@ public actor ReleasySender {
     return data + Data([0x00])
   }
 
-  public func send(_ frame: Data, on connection: NWConnection) {
-    connection.send(content: frame, completion: .contentProcessed({ error in
-      if let error {
-        print("Send data failed with \(error)")
-      }
-    }))
+  /// Queues the frame on the connection to `endpoint`, which receives it once it has processed
+  /// enough of the frames handed to it before.
+  private func send(_ frame: Data, to endpoint: NWEndpoint) {
+    guard let frames = links[endpoint]?.sendQueue.enqueue(frame) else { return }
+    write(frames, to: endpoint)
+  }
+
+  private func write(_ frames: [Data], to endpoint: NWEndpoint) {
+    guard let link = links[endpoint] else { return }
+    for frame in frames {
+      link.connection.send(content: frame, completion: .contentProcessed({ [weak self, id = link.id] error in
+        if let error {
+          print("Send data failed with \(error)")
+        }
+        Task { [weak self] in await self?.frameProcessed(byteCount: frame.count, endpoint: endpoint, id: id) }
+      }))
+    }
+  }
+
+  /// Hands the connection the frames that were waiting for it to process this one.
+  private func frameProcessed(byteCount: Int, endpoint: NWEndpoint, id: UUID) {
+    guard links[endpoint]?.id == id, let frames = links[endpoint]?.sendQueue.processed(byteCount: byteCount) else { return }
+    write(frames, to: endpoint)
   }
 
   /// The wait before the attempt following `failedAttempts` failures in a row, in seconds: 1, 2,
@@ -215,13 +234,14 @@ public actor ReleasySender {
   }
 
   private func connectionStateChanged(newState: NWConnection.State, endpoint: NWEndpoint, id: UUID) {
-    guard let link = links[endpoint], link.id == id else { return }
+    guard links[endpoint]?.id == id else { return }
     switch newState {
     case .ready:
       readyEndpoints.insert(endpoint)
       failedAttempts.removeValue(forKey: endpoint)
-      // The hello first, so that Releasy describes the logs that follow with it.
-      ([helloFrame()] + history.elements.map(frame(for:))).compactMap { $0 }.forEach { send($0, on: link.connection) }
+      // The hello first, so that Releasy describes the logs that follow with it. It is handed to
+      // the connection right away, so the history that follows can't push it out of the queue.
+      ([helloFrame()] + history.elements.map(frame(for:))).compactMap { $0 }.forEach { send($0, to: endpoint) }
     case .failed(let error):
       print("Connection failed with \(error)")
       retry(endpoint)
@@ -313,6 +333,56 @@ struct History<Element> {
     if elements.count > capacity {
       elements.removeFirst(elements.count - capacity)
     }
+  }
+}
+
+/// The frames to send on a connection, bounded so that a Releasy reading slowly doesn't grow the
+/// memory of the application without limit.
+///
+/// `NWConnection.send` queues without limit, and the frames handed to it can't be taken back. So
+/// only `maximumInFlightBytes` are handed to the connection until it has processed them, and the
+/// following frames wait here, up to `maximumPendingBytes`: beyond it, the oldest are dropped.
+struct SendQueue {
+  let maximumInFlightBytes: Int
+  let maximumPendingBytes: Int
+  /// The bytes handed to the connection that it has not processed yet.
+  private(set) var inFlightBytes = 0
+  /// The bytes of the frames waiting to be handed to the connection.
+  private(set) var pendingBytes = 0
+  private var pending: [Data] = []
+
+  init(maximumInFlightBytes: Int = 256 * 1024, maximumPendingBytes: Int = 1 << 20) {
+    self.maximumInFlightBytes = maximumInFlightBytes
+    self.maximumPendingBytes = maximumPendingBytes
+  }
+
+  /// Queues the frame, and returns the frames to hand to the connection now, in order.
+  mutating func enqueue(_ frame: Data) -> [Data] {
+    pending.append(frame)
+    pendingBytes += frame.count
+    let frames = dequeueReady()
+    while pendingBytes > maximumPendingBytes, !pending.isEmpty {
+      pendingBytes -= pending.removeFirst().count
+    }
+    return frames
+  }
+
+  /// Records that the connection processed a frame of `byteCount` bytes, and returns the frames to
+  /// hand to it now, in order.
+  mutating func processed(byteCount: Int) -> [Data] {
+    inFlightBytes = max(inFlightBytes - byteCount, 0)
+    return dequeueReady()
+  }
+
+  private mutating func dequeueReady() -> [Data] {
+    var frames: [Data] = []
+    while inFlightBytes < maximumInFlightBytes, !pending.isEmpty {
+      let frame = pending.removeFirst()
+      pendingBytes -= frame.count
+      inFlightBytes += frame.count
+      frames.append(frame)
+    }
+    return frames
   }
 }
 

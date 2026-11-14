@@ -108,3 +108,48 @@ import Testing
     #expect(json["timestamp"] as? Double == 10)
   }
 }
+
+@Suite struct SendQueueTests {
+  private func frame(_ byte: UInt8, size: Int = 10) -> Data {
+    Data(repeating: byte, count: size)
+  }
+
+  @Test func handsFramesToTheConnectionUpToTheInFlightLimit() {
+    var queue = SendQueue(maximumInFlightBytes: 20, maximumPendingBytes: 100)
+
+    #expect(queue.enqueue(frame(1)) == [frame(1)])
+    #expect(queue.enqueue(frame(2)) == [frame(2)])
+    // The connection holds 20 bytes it hasn't processed: the next frame waits.
+    #expect(queue.enqueue(frame(3)) == [])
+    #expect(queue.pendingBytes == 10)
+
+    #expect(queue.processed(byteCount: 10) == [frame(3)])
+    #expect(queue.inFlightBytes == 20)
+    #expect(queue.pendingBytes == 0)
+  }
+
+  @Test func dropsTheOldestWaitingFramesBeyondThePendingLimit() {
+    var queue = SendQueue(maximumInFlightBytes: 10, maximumPendingBytes: 20)
+
+    #expect(queue.enqueue(frame(1)) == [frame(1)])
+    for byte in UInt8(2)...5 {
+      #expect(queue.enqueue(frame(byte)) == [])
+    }
+    #expect(queue.pendingBytes == 20)
+
+    // Frames 2 and 3 were dropped: the latest ones are sent once the connection catches up.
+    #expect(queue.processed(byteCount: 10) == [frame(4)])
+    #expect(queue.processed(byteCount: 10) == [frame(5)])
+    #expect(queue.processed(byteCount: 10) == [])
+    #expect(queue.inFlightBytes == 0)
+  }
+
+  @Test func sendsALargeFrameWhenTheConnectionIsIdle() {
+    var queue = SendQueue(maximumInFlightBytes: 10, maximumPendingBytes: 20)
+
+    #expect(queue.enqueue(frame(1, size: 50)) == [frame(1, size: 50)])
+    // Waiting, a frame larger than the pending limit can't be kept.
+    #expect(queue.enqueue(frame(2, size: 50)) == [])
+    #expect(queue.pendingBytes == 0)
+  }
+}
