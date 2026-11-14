@@ -5,10 +5,12 @@ import Network
 import UIKit
 #endif
 
-/// Broadcasts analytics events and console logs to the Releasy instances found on the local network.
+/// Sends analytics events and console logs to the Releasy the application is paired with, found on
+/// the local network.
 ///
-/// Each payload is a JSON object (protocol version 1) terminated by a `\0` byte, sent over TCP to
-/// every `_releasy._tcp` Bonjour service.
+/// Nothing is sent until `pair(with:)` receives the pairing Releasy shows as a QR code. Each payload
+/// is then a JSON object (protocol version 1) terminated by a `\0` byte, sent over TLS with the
+/// pairing's pre-shared key to the `_releasy._tcp` Bonjour service advertising the paired Mac.
 public actor ReleasySender {
   @Dependency(\.date.now) var now
   @Dependency(\.uuid) var uuid
@@ -24,6 +26,9 @@ public actor ReleasySender {
   /// The longest wait between two connection attempts to a Releasy, in seconds.
   static let maximumRetryDelay: TimeInterval = 30
 
+  /// The user defaults key the pairing is stored under.
+  static let pairingKey = "releasy.pairing"
+
   /// A connection to a Releasy, identified so that the events of a connection that was replaced,
   /// such as the `.cancelled` state that follows its cancellation, are ignored.
   private struct Link {
@@ -36,7 +41,11 @@ public actor ReleasySender {
   /// that sending logs doesn't take time from the application's interface.
   private let queue = DispatchQueue(label: "com.releasy.sender", qos: .utility)
   private var browser: NWBrowser?
-  /// The Releasy instances currently advertised on the network.
+  /// The Releasy the application is paired with, kept across launches. `nil` until paired.
+  public private(set) var pairing: ReleasyPairing? = ReleasySender.storedPairing()
+  /// The identifier of the Mac each Releasy advertised on the network runs on.
+  private var advertisedMacIds = [NWEndpoint: String]()
+  /// The advertised Releasy instances running on the paired Mac: the only ones connected to.
   private var advertisedEndpoints = Set<NWEndpoint>()
   private var links = [NWEndpoint: Link]()
   private var readyEndpoints = Set<NWEndpoint>()
@@ -50,6 +59,21 @@ public actor ReleasySender {
       await setupBrowser()
       await observeForeground()
     }
+  }
+
+  /// Pairs the application with the Releasy that showed `pairing`, and connects to it. The
+  /// connections to a Releasy paired before are closed.
+  public func pair(with pairing: ReleasyPairing) {
+    self.pairing = pairing
+    UserDefaults.standard.set(try? JSONEncoder().encode(pairing), forKey: Self.pairingKey)
+    restartConnections()
+  }
+
+  /// Stops sending to the paired Releasy.
+  public func unpair() {
+    pairing = .none
+    UserDefaults.standard.removeObject(forKey: Self.pairingKey)
+    restartConnections()
   }
 
   public func send(_ payload: ReleasyPayload) {
@@ -82,7 +106,8 @@ public actor ReleasySender {
     let parameters = NWParameters.tcp
     // Also find a Releasy over a direct iPhone–Mac link (AWDL), when they share no Wi-Fi network.
     parameters.includePeerToPeer = true
-    let browser = NWBrowser(for: .bonjour(type: "_releasy._tcp", domain: nil), using: parameters)
+    // The TXT record tells which Mac each Releasy runs on.
+    let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_releasy._tcp", domain: nil), using: parameters)
     browser.stateUpdateHandler = { [weak self] newState in
       Task { [weak self] in await self?.browserStateChanged(newState: newState) }
     }
@@ -108,23 +133,47 @@ public actor ReleasySender {
   private func browseResultsChanged(changes: Set<NWBrowser.Result.Change>) {
     for change in changes {
       switch change {
-      case .added(let result):
-        advertisedEndpoints.insert(result.endpoint)
-        connect(to: result.endpoint)
+      case .added(let result), .changed(_, let result, _):
+        if case .bonjour(let txtRecord) = result.metadata, let macId = txtRecord["id"] {
+          advertisedMacIds[result.endpoint] = macId
+        } else {
+          advertisedMacIds.removeValue(forKey: result.endpoint)
+        }
+        refresh(result.endpoint)
       case .removed(let result):
-        advertisedEndpoints.remove(result.endpoint)
-        forget(result.endpoint)
+        advertisedMacIds.removeValue(forKey: result.endpoint)
+        refresh(result.endpoint)
       default: break
       }
     }
   }
 
+  /// Connects to an advertised Releasy running on the paired Mac, and forgets any other.
+  private func refresh(_ endpoint: NWEndpoint) {
+    if let pairing, advertisedMacIds[endpoint] == pairing.macId {
+      advertisedEndpoints.insert(endpoint)
+      connect(to: endpoint)
+    } else {
+      advertisedEndpoints.remove(endpoint)
+      forget(endpoint)
+    }
+  }
+
+  /// Closes every connection, which uses the previous pairing, and connects again with the current one.
+  private func restartConnections() {
+    for endpoint in Set(links.keys).union(retryTasks.keys) {
+      forget(endpoint)
+    }
+    advertisedEndpoints.removeAll()
+    advertisedMacIds.keys.forEach(refresh)
+  }
+
   // MARK: - Connections
 
   private func connect(to endpoint: NWEndpoint) {
-    guard links[endpoint] == nil, advertisedEndpoints.contains(endpoint) else { return }
+    guard links[endpoint] == nil, advertisedEndpoints.contains(endpoint), let pairing else { return }
     let id = uuid()
-    let connection = NWConnection(to: endpoint, using: .releasy)
+    let connection = NWConnection(to: endpoint, using: .releasy(pairing: pairing))
     links[endpoint] = Link(id: id, connection: connection)
     // The handler captures the endpoint and the id rather than the connection: capturing the
     // connection inside its own `stateUpdateHandler` retains it forever.
@@ -212,6 +261,7 @@ public actor ReleasySender {
       // browser finds, which it reports as added.
       advertisedEndpoints.forEach(forget)
       advertisedEndpoints.removeAll()
+      advertisedMacIds.removeAll()
       setupBrowser()
       return
     }
@@ -221,6 +271,12 @@ public actor ReleasySender {
       disconnect(from: endpoint)
       connect(to: endpoint)
     }
+  }
+}
+
+extension ReleasySender {
+  private static func storedPairing() -> ReleasyPairing? {
+    UserDefaults.standard.data(forKey: pairingKey).flatMap { try? JSONDecoder().decode(ReleasyPairing.self, from: $0) }
   }
 }
 
@@ -242,9 +298,9 @@ struct History {
 }
 
 extension NWParameters {
-  /// TCP parameters that notice a vanished Releasy, such as a Mac gone to sleep or off the network,
-  /// instead of keeping a dead connection.
-  static var releasy: NWParameters {
+  /// TLS-PSK parameters with the pairing's key, and TCP parameters that notice a vanished Releasy,
+  /// such as a Mac gone to sleep or off the network, instead of keeping a dead connection.
+  static func releasy(pairing: ReleasyPairing) -> NWParameters {
     let tcp = NWProtocolTCP.Options()
     // Send each small log right away rather than waiting to batch it.
     tcp.noDelay = true
@@ -259,7 +315,7 @@ extension NWParameters {
     tcp.keepaliveIdle = 10
     tcp.keepaliveInterval = 5
     tcp.keepaliveCount = 3
-    let parameters = NWParameters(tls: nil, tcp: tcp)
+    let parameters = NWParameters(tls: pairing.tlsOptions, tcp: tcp)
     // Reach a Releasy found over a direct iPhone–Mac link (AWDL) as well as over the Wi-Fi network.
     parameters.includePeerToPeer = true
     return parameters
